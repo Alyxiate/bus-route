@@ -1,6 +1,7 @@
 name: Install Boreal Android source
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -20,7 +21,21 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Detect prepared source archive
+        id: archive
+        shell: bash
+        env:
+          ARCHIVE: boreal-android-v5.1-native-repository.zip
+        run: |
+          if [[ -f "$ARCHIVE" ]]; then
+            echo 'present=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'present=false' >> "$GITHUB_OUTPUT"
+            echo 'Prepared archive is already absent; no source installation is required.'
+          fi
+
       - name: Verify and extract prepared source
+        if: steps.archive.outputs.present == 'true'
         shell: bash
         env:
           ARCHIVE: boreal-android-v5.1-native-repository.zip
@@ -46,11 +61,12 @@ jobs:
           chmod +x gradlew
 
       - name: Commit extracted Android project
+        if: steps.archive.outputs.present == 'true'
         shell: bash
         run: |
           set -euo pipefail
+          git restore --source=HEAD --staged --worktree .github
           rm boreal-android-v5.1-native-repository.zip
-          rm .github/workflows/bootstrap-source.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add --all
