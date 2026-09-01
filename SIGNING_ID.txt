@@ -1,0 +1,6 @@
+Boreal Android release signing certificate
+SHA-256: EF:0A:81:C7:E5:7C:C5:8C:6A:9D:2E:DE:EC:32:2F:93:78:89:DC:9E:14:95:B0:11:59:8B:90:20:6F:69:6D:DB
+
+Boreal 5.1 Native keeps package com.borealroutes.app and uses versionCode 11. An APK signed separately with the retained Boreal release key can update earlier compatible installs in-place.
+
+The private signing key is intentionally NOT included in this source archive.
