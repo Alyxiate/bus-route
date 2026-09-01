@@ -25,6 +25,12 @@ jobs:
       EXPECTED_SHA256: ${{ inputs.source_sha256 || vars.BOREAL_SOURCE_ZIP_SHA256 }}
 
     steps:
+      - name: Check out trusted Gradle wrapper
+        uses: actions/checkout@v4
+
+      - name: Validate trusted Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
       - name: Validate source configuration
         shell: bash
         run: |
@@ -49,7 +55,7 @@ jobs:
           set -euo pipefail
           source_zip="$RUNNER_TEMP/boreal-source.zip"
           source_dir="$RUNNER_TEMP/boreal-source"
-          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 \
             --output "$source_zip" "$SOURCE_URL"
           printf '%s  %s\n' "${EXPECTED_SHA256,,}" "$source_zip" | sha256sum --check --strict
           mkdir -p "$source_dir"
@@ -72,20 +78,23 @@ jobs:
               raise SystemExit(f'Invalid source ZIP: {error}') from error
           PY
 
-          mapfile -t wrappers < <(find "$source_dir" -type f -name gradlew -print)
-          if [[ "${#wrappers[@]}" -ne 1 ]]; then
-            echo "::error::Expected exactly one Gradle wrapper in the verified ZIP; found ${#wrappers[@]}."
+          mapfile -t settings_files < <(find "$source_dir" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print)
+          if [[ "${#settings_files[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one Gradle project in the verified ZIP; found ${#settings_files[@]}."
             exit 1
           fi
 
-          project_dir="$(dirname "${wrappers[0]}")"
-          if [[ ! -f "$project_dir/settings.gradle" && ! -f "$project_dir/settings.gradle.kts" ]]; then
-            echo '::error::The extracted Gradle project has no settings.gradle or settings.gradle.kts.'
-            exit 1
-          fi
+          project_dir="$(dirname "${settings_files[0]}")"
           if [[ ! -f "$project_dir/app/build.gradle" && ! -f "$project_dir/app/build.gradle.kts" ]]; then
             echo '::error::The extracted source has no Android app module.'
             exit 1
+          fi
+          if [[ ! -f "$project_dir/gradlew" || ! -f "$project_dir/gradle/wrapper/gradle-wrapper.jar" || ! -f "$project_dir/gradle/wrapper/gradle-wrapper.properties" ]]; then
+            echo 'Source ZIP has no complete Gradle wrapper; using the trusted repository wrapper.'
+            cp "$GITHUB_WORKSPACE/gradlew" "$project_dir/gradlew"
+            cp "$GITHUB_WORKSPACE/gradlew.bat" "$project_dir/gradlew.bat"
+            mkdir -p "$project_dir/gradle"
+            cp -R "$GITHUB_WORKSPACE/gradle/wrapper" "$project_dir/gradle/"
           fi
 
           echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
@@ -141,4 +150,3 @@ jobs:
           path: ${{ steps.source.outputs.apk }}
           if-no-files-found: error
           retention-days: 30
-
