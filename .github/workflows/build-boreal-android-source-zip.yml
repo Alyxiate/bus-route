@@ -1,0 +1,144 @@
+name: Build Boreal Native Android from Verified Source ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_url:
+        description: Public HTTPS source ZIP URL (overrides BOREAL_SOURCE_ZIP_URL repository variable)
+        required: false
+        type: string
+      source_sha256:
+        description: Exact SHA-256 (overrides BOREAL_SOURCE_ZIP_SHA256 repository variable)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-release:
+    name: Verify, test and assemble unsigned release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_URL: ${{ inputs.source_url || vars.BOREAL_SOURCE_ZIP_URL }}
+      EXPECTED_SHA256: ${{ inputs.source_sha256 || vars.BOREAL_SOURCE_ZIP_SHA256 }}
+
+    steps:
+      - name: Validate source configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${SOURCE_URL:-}" || -z "${EXPECTED_SHA256:-}" ]]; then
+            echo '::error::Provide source_url and source_sha256 inputs, or configure BOREAL_SOURCE_ZIP_URL and BOREAL_SOURCE_ZIP_SHA256 repository variables.'
+            exit 1
+          fi
+          if [[ ! "$SOURCE_URL" =~ ^https:// ]]; then
+            echo '::error::The Boreal source URL must use HTTPS.'
+            exit 1
+          fi
+          if [[ ! "$EXPECTED_SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+            echo '::error::The expected SHA-256 must contain exactly 64 hexadecimal characters.'
+            exit 1
+          fi
+
+      - name: Download and verify source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_zip="$RUNNER_TEMP/boreal-source.zip"
+          source_dir="$RUNNER_TEMP/boreal-source"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$source_zip" "$SOURCE_URL"
+          printf '%s  %s\n' "${EXPECTED_SHA256,,}" "$source_zip" | sha256sum --check --strict
+          mkdir -p "$source_dir"
+          python3 - "$source_zip" "$source_dir" <<'PY'
+          import sys
+          from pathlib import Path, PurePosixPath
+          from zipfile import BadZipFile, ZipFile
+
+          archive = Path(sys.argv[1])
+          destination = Path(sys.argv[2]).resolve()
+          try:
+              with ZipFile(archive) as source:
+                  for member in source.infolist():
+                      name = member.filename.replace('\\', '/')
+                      path = PurePosixPath(name)
+                      if path.is_absolute() or '..' in path.parts:
+                          raise SystemExit(f'Unsafe ZIP entry: {member.filename}')
+                  source.extractall(destination)
+          except BadZipFile as error:
+              raise SystemExit(f'Invalid source ZIP: {error}') from error
+          PY
+
+          mapfile -t wrappers < <(find "$source_dir" -type f -name gradlew -print)
+          if [[ "${#wrappers[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one Gradle wrapper in the verified ZIP; found ${#wrappers[@]}."
+            exit 1
+          fi
+
+          project_dir="$(dirname "${wrappers[0]}")"
+          if [[ ! -f "$project_dir/settings.gradle" && ! -f "$project_dir/settings.gradle.kts" ]]; then
+            echo '::error::The extracted Gradle project has no settings.gradle or settings.gradle.kts.'
+            exit 1
+          fi
+          if [[ ! -f "$project_dir/app/build.gradle" && ! -f "$project_dir/app/build.gradle.kts" ]]; then
+            echo '::error::The extracted source has no Android app module.'
+            exit 1
+          fi
+
+          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
+          echo "apk=$project_dir/app/build/outputs/apk/release/app-release-unsigned.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android 35 SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            'platform-tools' \
+            'platforms;android-35' \
+            'build-tools;35.0.0'
+
+      - name: Set up Gradle caching
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x '${{ steps.source.outputs.project_dir }}/gradlew'
+
+      - name: Run release unit tests
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: ./gradlew --no-daemon :app:testReleaseUnitTest
+
+      - name: Assemble unsigned release APK
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Verify unsigned APK output
+        shell: bash
+        env:
+          APK_PATH: ${{ steps.source.outputs.apk }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s "$APK_PATH" ]]; then
+            echo "::error::Expected unsigned release APK was not created at $APK_PATH"
+            exit 1
+          fi
+
+      - name: Upload unsigned APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Boreal-Native-Unsigned-APK
+          path: ${{ steps.source.outputs.apk }}
+          if-no-files-found: error
+          retention-days: 30
+
