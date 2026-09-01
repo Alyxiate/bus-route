@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
+      - '.github/workflows/build-boreal-android.yml'
       - '**/*.gradle'
       - '**/*.gradle.kts'
       - '**/*.java'
@@ -18,6 +19,7 @@ on:
       - 'settings.gradle.kts'
   pull_request:
     paths:
+      - '.github/workflows/build-boreal-android.yml'
       - '**/*.gradle'
       - '**/*.gradle.kts'
       - '**/*.java'
@@ -43,10 +45,32 @@ jobs:
     name: Test and assemble unsigned release
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version_name: ${{ steps.version.outputs.version_name }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
 
     steps:
       - name: Check out Android source
         uses: actions/checkout@v4
+
+      - name: Resolve Android release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_name="$(sed -nE 's/^[[:space:]]*versionName[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' app/build.gradle.kts | head -n 1)"
+          if [[ -z "$version_name" ]]; then
+            echo '::error::Unable to read versionName from app/build.gradle.kts.'
+            exit 1
+          fi
+          if [[ ! "$version_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::versionName contains characters that are unsafe for a Git tag: $version_name"
+            exit 1
+          fi
+          echo "version_name=$version_name" >> "$GITHUB_OUTPUT"
+          echo "release_tag=boreal-android-v$version_name" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -100,3 +124,52 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  publish-release:
+    name: Publish versioned unsigned release
+    needs: build-release
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download unsigned APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Boreal-Native-Unsigned-APK
+          path: release-assets
+
+      - name: Create APK SHA-256 asset
+        working-directory: release-assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app-release-unsigned.apk
+          sha256sum app-release-unsigned.apk > app-release-unsigned.apk.sha256
+          sha256sum --check app-release-unsigned.apk.sha256
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.build-release.outputs.release_tag }}
+          VERSION_NAME: ${{ needs.build-release.outputs.version_name }}
+        run: |
+          set -euo pipefail
+          apk='release-assets/app-release-unsigned.apk'
+          checksum='release-assets/app-release-unsigned.apk.sha256'
+          title="Boreal Android $VERSION_NAME"
+          notes="Unsigned Boreal native Android release for version $VERSION_NAME. Signing is handled separately outside GitHub."
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$apk" "$checksum" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" "$apk" "$checksum" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
